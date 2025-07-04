@@ -1,0 +1,12 @@
+// In server.js, apply the following changes:
+
+// 1. At the top of the file, import middleware:
+import rateLimiter from './middleware/rateLimiter.js';
+import redisClient from './redis.js';
+
+// 2. Before all routes, apply rate limiting middleware:
+app.use(rateLimiter);
+
+// 3. Integrate redisClient wherever you manage pub/sub for WebSocket scaling.
+//    e.g., replace in-memory broadcast with Redis pub/sub channels.
+//    This will require ws-server modification if scaling WebSocket connections.

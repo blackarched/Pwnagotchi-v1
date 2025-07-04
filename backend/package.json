@@ -1,0 +1,26 @@
+{
+  "name": "pwn-dashboard-backend",
+  "version": "1.0.0",
+  "description": "Backend proxy for Pwnagotchi Local API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "lint": "eslint .",
+    "test": "jest"
+  },
+  "engines": {
+    "node": ">=16"
+  },
+  "dependencies": {
+    "axios": "^1.4.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.0.0",
+    "express": "^4.18.2",
+    "ws": "^8.13.0",
+    "winston": "^3.8.2"
+  },
+  "devDependencies": {
+    "eslint": "^8.32.0",
+    "jest": "^29.5.0"
+  }
+}
