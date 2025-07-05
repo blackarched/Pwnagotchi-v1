@@ -1,21 +1,73 @@
 version: '3.8'
+
+networks:
+  pwnagotchi_net:
+    driver: bridge
+
+volumes:
+  redis-data:
+    driver: local
+
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: pwnagotchi-redis
+    restart: unless-stopped
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - pwnagotchi_net
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
-    build: ./backend
+    build:
+      context: ./backend # Ensure context is specified if Dockerfile is not in root of context
+      dockerfile: Dockerfile # Explicitly state Dockerfile name
+    container_name: pwnagotchi-backend
     env_file: .env
-    ports: ["3000:3000"]
-    healthcheck: …
+    ports:
+      - "${BACKEND_PORT:-3001}:3001" # Use variable from .env, default to 3001
+    depends_on: # Added explicit dependency on redis
+      redis:
+        condition: service_healthy
+    networks: # Assign to custom network
+      - pwnagotchi_net
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3001/healthz || exit 1"] # Updated healthcheck
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
     restart: unless-stopped
 
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile.frontend
-    env_file: .env
-    ports: ["80:80"]
+      args: # Add build arguments for Vite
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:3001/api}
+        VITE_WS_URL: ${VITE_WS_URL:-ws://localhost:3001}
+        VITE_WEBSOCKET_PATH: ${VITE_WEBSOCKET_PATH:-/socket.io}
+    container_name: pwnagotchi-frontend # Added container_name
+    env_file: .env # For build args from .env
+    ports:
+      - "${FRONTEND_PORT:-8080}:80" # Use variable from .env, default to 8080
     depends_on:
       backend:
         condition: service_healthy
+    networks: # Assign to custom network
+      - pwnagotchi_net
+    healthcheck: # Added healthcheck for frontend
+      test: ["CMD-SHELL", "wget --spider -q http://localhost/index.html || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 5s
     restart: unless-stopped
-networks:
-  default: {}
+# Removed default network, using pwnagotchi_net instead

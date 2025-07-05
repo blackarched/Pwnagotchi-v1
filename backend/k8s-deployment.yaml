@@ -1,89 +1,305 @@
+# This Kubernetes manifest deploys the Pwnagotchi Dashboard application (backend, frontend, redis).
+
+# --- ConfigMap ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pwnagotchi-dashboard-config
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+data:
+  NODE_ENV: "production"
+  LOG_LEVEL: "info"
+  BACKEND_PORT: "3001"
+  REDIS_URL: "redis://pwnagotchi-redis-service:6379"
+  WEBSOCKET_PATH: "/socket.io"
+  ENABLE_PWNAGOTCHI_POLLING: "true"
+  PWNAGOTCHI_POLL_INTERVAL_MS: "5000"
+  ENABLE_METRICS: "true"
+  PWNAGOTCHI_HOST: "your-pwnagotchi-ip-or-hostname" # Replace
+  PWNAGOTCHI_PORT: "22"
+  PWNAGOTCHI_USER: "pi"
+  PWNAGOTCHI_SSH_KEY_PATH: "/mnt/ssh-keys/pwnagotchi_rsa"
+  PWNAGOTCHI_API_BASE_URL: "http://your-pwnagotchi-ip-or-hostname:8666/api/v1" # If Pwnagotchi has a direct API
+  VITE_API_URL: "/api"
+  VITE_WS_URL: ""
+  VITE_WEBSOCKET_PATH: "/socket.io"
+
+---
+# --- Backend Deployment ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: pwnagotchi-backend
-spec:
-  replicas: 2
-  selector:
-    matchLabels:
-      app: pwnagotchi-backend
-  template:
-    metadata:
-      labels:
-        app: pwnagotchi-backend
-    spec:
-      containers:
-      - name: backend
-        image: yourregistry/pwnagotchi-backend:latest
-        ports:
-        - containerPort: 3000
-        env:
-        - name: REDIS_URL
-          value: redis://redis:6379
-
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: backend-service
-spec:
-  selector:
-    app: pwnagotchi-backend
-  ports:
-  - protocol: TCP
-    port: 80
-    targetPort: 3000
-
----
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: redis
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: backend
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: redis
+      app.kubernetes.io/name: pwnagotchi-dashboard
+      app.kubernetes.io/component: backend
   template:
     metadata:
       labels:
-        app: redis
+        app.kubernetes.io/name: pwnagotchi-dashboard
+        app.kubernetes.io/component: backend
     spec:
       containers:
-      - name: redis
-        image: redis:6-alpine
+      - name: backend
+        image: yourregistry/pwnagotchi-backend:latest # Replace
+        imagePullPolicy: IfNotPresent
         ports:
-        - containerPort: 6379
+        - name: http
+          containerPort: 3001 # Matches BACKEND_PORT
+        envFrom:
+        - configMapRef:
+            name: pwnagotchi-dashboard-config
+        # volumeMounts:
+        # - name: ssh-key-volume
+        #   mountPath: "/mnt/ssh-keys"
+        #   readOnly: true
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+          limits: { cpu: "500m", memory: "256Mi" }
+      # volumes:
+      # - name: ssh-key-volume
+      #   secret:
+      #     secretName: pwnagotchi-ssh-key # Create this secret separately
+      #     defaultMode: 0400
 
 ---
+# --- Backend Service ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redis
+  name: pwnagotchi-backend-service
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: backend
 spec:
+  type: ClusterIP
   selector:
-    app: redis
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: backend
   ports:
-  - protocol: TCP
-    port: 6379
-    targetPort: 6379
+  - name: http
+    port: 80 # Service port
+    targetPort: http # Pod port name
 
 ---
+# --- Frontend Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pwnagotchi-frontend
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: frontend
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pwnagotchi-dashboard
+      app.kubernetes.io/component: frontend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pwnagotchi-dashboard
+        app.kubernetes.io/component: frontend
+    spec:
+      containers:
+      - name: frontend
+        image: yourregistry/pwnagotchi-frontend:latest # Replace
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: http
+          containerPort: 80 # Nginx port
+        # envFrom: # If frontend runtime needed env vars (less common for static sites)
+        # - configMapRef:
+        #     name: pwnagotchi-dashboard-config
+        livenessProbe:
+          httpGet:
+            path: /index.html
+            port: http
+          initialDelaySeconds: 10
+          periodSeconds: 20
+        readinessProbe:
+          httpGet:
+            path: /index.html
+            port: http
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests: { cpu: "50m", memory: "64Mi" }
+          limits: { cpu: "200m", memory: "128Mi" }
+
+---
+# --- Frontend Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pwnagotchi-frontend-service
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: frontend
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: frontend
+  ports:
+  - name: http
+    port: 80
+    targetPort: http
+
+---
+# --- Redis Deployment --- (Original content follows, will be updated in next step)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pwnagotchi-redis # Renamed for consistency
+  labels: # Added standard labels
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels: # Updated selector
+      app.kubernetes.io/name: pwnagotchi-dashboard
+      app.kubernetes.io/component: redis
+  template:
+    metadata:
+      labels: # Updated labels
+        app.kubernetes.io/name: pwnagotchi-dashboard
+        app.kubernetes.io/component: redis
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine # Updated to 7-alpine to match compose
+        imagePullPolicy: IfNotPresent
+        ports:
+        - name: redis # Named port
+          containerPort: 6379
+        livenessProbe:
+          tcpSocket:
+            port: redis
+          initialDelaySeconds: 15
+          periodSeconds: 20
+        readinessProbe:
+          tcpSocket:
+            port: redis
+          initialDelaySeconds: 5
+          periodSeconds: 10
+        resources:
+          requests: { cpu: "100m", memory: "128Mi" }
+          limits: { cpu: "200m", memory: "256Mi" }
+        # volumeMounts:
+        # - name: redis-data
+        #   mountPath: /data # If using PVC
+      # volumes:
+      # - name: redis-data
+      #   persistentVolumeClaim:
+      #     claimName: pwnagotchi-redis-pvc # PVC needs to be created separately
+
+---
+# --- Redis Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pwnagotchi-redis-service # Renamed for consistency
+  labels: # Added standard labels
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: redis
+spec:
+  type: ClusterIP
+  selector: # Updated selector
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: redis
+  ports:
+  - name: redis # Named port
+    port: 6379
+    targetPort: redis # Target named port
+
+---
+# --- Backend HorizontalPodAutoscaler ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: backend-hpa
+  name: pwnagotchi-backend-hpa
+  labels: # Added standard labels
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: backend
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: pwnagotchi-backend
-  minReplicas: 2
-  maxReplicas: 10
+  minReplicas: 1 # Matched to backend deployment replica
+  maxReplicas: 5 # Adjusted
   metrics:
   - type: Resource
     resource:
       name: cpu
       target:
         type: Utilization
-        averageUtilization: 50
+        averageUtilization: 70 # Adjusted
+  # - type: Resource
+  #   resource:
+  #     name: memory
+  #     target:
+  #       type: Utilization
+  #       averageUtilization: 70
+
+# --- Optional: Ingress for Frontend ---
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: pwnagotchi-dashboard-ingress
+#   labels:
+#     app.kubernetes.io/name: pwnagotchi-dashboard
+#   # annotations:
+#   #   nginx.ingress.kubernetes.io/rewrite-target: /
+#   #   kubernetes.io/ingress.class: "nginx"
+# spec:
+#   rules:
+#   - http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: pwnagotchi-frontend-service
+#             port:
+#               name: http
+#       - path: /api
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: pwnagotchi-backend-service
+#             port:
+#               name: http
+#       - path: /socket.io
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: pwnagotchi-backend-service
+#             port:
+#               name: http # Socket.IO upgrades from HTTP
+#   # tls:
+#   # - hosts:
+#   #   - your-dashboard-domain.com
+#   #   secretName: your-tls-secret
