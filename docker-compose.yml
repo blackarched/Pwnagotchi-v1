@@ -30,13 +30,23 @@ services:
       context: ./backend # Ensure context is specified if Dockerfile is not in root of context
       dockerfile: Dockerfile # Explicitly state Dockerfile name
     container_name: pwnagotchi-backend
-    env_file: .env
+    env_file: .env # Loads variables from .env file first
+    environment: # These can override or add to what's in .env for this service
+      # For testing, point to the mock Pwnagotchi service
+      # These will be used by pwnagotchiService.js if NODE_ENV=test or if they are present
+      MOCK_PWNAGOTCHI_API_URL: http://mock-pwnagotchi:8666/api/v1
+      MOCK_PWNAGOTCHI_CLI_URL: http://mock-pwnagotchi:8666/api/v1/cli-command
+      # Ensure NODE_ENV can be set to 'test' when running integration tests,
+      # or rely on the presence of MOCK_* URLs in pwnagotchiService.js
+      # NODE_ENV: ${NODE_ENV:-development} # Can be overridden by test runner environment
     ports:
-      - "${BACKEND_PORT:-3001}:3001" # Use variable from .env, default to 3001
-    depends_on: # Added explicit dependency on redis
+      - "${BACKEND_PORT:-3001}:3001"
+    depends_on:
       redis:
         condition: service_healthy
-    networks: # Assign to custom network
+      mock-pwnagotchi: # Backend depends on mock for testing
+        condition: service_started # Or service_healthy if mock implements a healthcheck
+    networks:
       - pwnagotchi_net
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:3001/healthz || exit 1"] # Updated healthcheck
@@ -70,4 +80,15 @@ services:
       retries: 3
       start_period: 5s
     restart: unless-stopped
+
+  mock-pwnagotchi:
+    build:
+      context: ./test/mock-pwnagotchi
+      dockerfile: Dockerfile
+    container_name: mock-pwnagotchi-server
+    networks:
+      - pwnagotchi_net
+    ports:
+      - "8666:8666" # Expose mock server port for direct inspection if needed
+    # No restart policy, typically only run during tests
 # Removed default network, using pwnagotchi_net instead

@@ -14,7 +14,8 @@ const logger = createLogger({
 
 const ssh = new NodeSSH();
 let sshConnectionConfig = null;
-let pwnagotchiApiBaseUrl = null;
+let pwnagotchiApiBaseUrl = null; // For real Pwnagotchi API
+let mockPwnagotchiCliUrl = null; // For mock CLI over HTTP
 
 /**
  * Initializes the Pwnagotchi service with connection details.
@@ -25,37 +26,46 @@ export function initPwnagotchiService() {
     PWNAGOTCHI_HOST,
     PWNAGOTCHI_PORT,
     PWNAGOTCHI_USER,
-    PWNAGOTCHI_SSH_KEY_PATH, // Path to the private key file
+    PWNAGOTCHI_SSH_KEY_PATH,
     PWNAGOTCHI_API_BASE_URL,
+    MOCK_PWNAGOTCHI_API_URL, // For testing: overrides PWNAGOTCHI_API_BASE_URL
+    MOCK_PWNAGOTCHI_CLI_URL, // For testing: used by executePwnagotchiCommand to simulate CLI via HTTP
   } = process.env;
 
-  if (!PWNAGOTCHI_HOST || !PWNAGOTCHI_USER) {
-    logger.warn('Pwnagotchi SSH host or user not configured. SSH functionalities will be disabled.');
-  } else {
-    sshConnectionConfig = {
-      host: PWNAGOTCHI_HOST,
-      port: parseInt(PWNAGOTCHI_PORT, 10) || 22,
-      username: PWNAGOTCHI_USER,
-      // privateKeyPath will be used if no privateKey content is provided
-      // For security, it's better to load key content from a secure store or env var if possible,
-      // but privateKeyPath is common for local file system keys.
-    };
-    if (PWNAGOTCHI_SSH_KEY_PATH) {
-      sshConnectionConfig.privateKeyPath = PWNAGOTCHI_SSH_KEY_PATH;
-      logger.info(`Using SSH key from path: ${PWNAGOTCHI_SSH_KEY_PATH}`);
-    } else {
-      logger.warn('PWNAGOTCHI_SSH_KEY_PATH not set. SSH connections may fail if password auth is disabled on Pwnagotchi.');
-      // Consider adding password support if absolutely necessary, though key-based is preferred.
-    }
-  }
-
-  if (PWNAGOTCHI_API_BASE_URL) {
+  // Configure for mock server if MOCK URLs are provided
+  if (MOCK_PWNAGOTCHI_API_URL) {
+    pwnagotchiApiBaseUrl = MOCK_PWNAGOTCHI_API_URL;
+    logger.info(`Using MOCK Pwnagotchi API base URL: ${pwnagotchiApiBaseUrl}`);
+  } else if (PWNAGOTCHI_API_BASE_URL) {
     pwnagotchiApiBaseUrl = PWNAGOTCHI_API_BASE_URL;
     logger.info(`Pwnagotchi direct API base URL configured: ${pwnagotchiApiBaseUrl}`);
   } else {
     logger.info('Pwnagotchi direct API base URL not configured. Direct API calls will be disabled.');
   }
-  logger.info('Pwnagotchi service initialized with current environment variables.');
+
+  if (MOCK_PWNAGOTCHI_CLI_URL) {
+    mockPwnagotchiCliUrl = MOCK_PWNAGOTCHI_CLI_URL;
+    logger.info(`Using MOCK Pwnagotchi CLI URL for simulated commands: ${mockPwnagotchiCliUrl}`);
+    // SSH config might not be needed if all commands are mocked via HTTP
+    sshConnectionConfig = null; // Explicitly disable SSH if mock CLI URL is set
+    logger.warn('SSH connections disabled due to MOCK_PWNAGOTCHI_CLI_URL being set.');
+  } else if (PWNAGOTCHI_HOST && PWNAGOTCHI_USER) {
+    sshConnectionConfig = {
+      host: PWNAGOTCHI_HOST,
+      port: parseInt(PWNAGOTCHI_PORT, 10) || 22,
+      username: PWNAGOTCHI_USER,
+    };
+    if (PWNAGOTCHI_SSH_KEY_PATH) {
+      sshConnectionConfig.privateKeyPath = PWNAGOTCHI_SSH_KEY_PATH;
+      logger.info(`Using SSH key for real Pwnagotchi: ${PWNAGOTCHI_SSH_KEY_PATH}`);
+    } else {
+      logger.warn('PWNAGOTCHI_SSH_KEY_PATH not set. Real SSH connections may fail.');
+    }
+  } else {
+    logger.warn('Real Pwnagotchi SSH host or user not configured. SSH functionalities will be disabled.');
+    sshConnectionConfig = null;
+  }
+  logger.info('Pwnagotchi service initialized.');
 }
 
 /**
@@ -88,8 +98,25 @@ async function getSshConnection() {
  * @returns {Promise<{stdout: string, stderr: string, code: number}>} Result of the command execution.
  */
 export async function executePwnagotchiCommand(command, options = {}) {
+  // If mock CLI URL is configured, use it instead of SSH
+  if (mockPwnagotchiCliUrl) {
+    logger.info(`Executing MOCKED command via HTTP POST to ${mockPwnagotchiCliUrl}: ${command}`);
+    try {
+      const response = await axios.post(mockPwnagotchiCliUrl, { command });
+      // Assuming the mock server returns a structure like { stdout, stderr, code }
+      return response.data;
+    } catch (error) {
+      logger.error(`Error executing MOCKED command '${command}' via HTTP: ${error.message}`, {
+        status: error.response?.status,
+        data: error.response?.data,
+      });
+      return { stdout: '', stderr: `Failed to contact mock CLI server: ${error.message}`, code: -1 };
+    }
+  }
+
+  // Original SSH logic
   if (!sshConnectionConfig) {
-    logger.error('Cannot execute command: SSH not configured.');
+    logger.error('Cannot execute command: SSH not configured (and no mock CLI URL provided).');
     return { stdout: '', stderr: 'SSH not configured.', code: -1 };
   }
 
