@@ -10,10 +10,13 @@ import {
   Lock,
   Power,
   BarChart2,
-  GitBranch
+  GitBranch,
+  Moon,
+  Sun
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/components/ui/use-toast';
+import { useTheme } from '@/hooks/useTheme'; // Import useTheme
 import NetworkMap from '@/components/NetworkMap';
 import SystemMetrics from '@/components/SystemMetrics';
 import HandshakeCapture from '@/components/HandshakeCapture';
@@ -27,6 +30,7 @@ import { usePwnagotchi } from '@/hooks/usePwnagotchi';
 
 const PwnagotchiDashboard = () => {
   const { toast } = useToast();
+  const { theme, toggleTheme } = useTheme(); // Use the theme hook
   const [activeTab, setActiveTab] = useState('overview');
   const {
     pwnagotchiState,
@@ -77,39 +81,61 @@ const PwnagotchiDashboard = () => {
     { id: 'terminal', label: 'TERMINAL', icon: Terminal }
   ];
 
+  // Base classes for light theme, dark theme will override these
+  const baseAppClasses = "min-h-screen transition-colors duration-300";
+  const lightAppClasses = "bg-gray-100 text-slate-900";
+  const darkAppClasses = "dark:bg-black dark:text-cyan-400 cyber-matrix"; // cyber-matrix likely adds specific dark visual effects
+
+  const basePanelClasses = "transition-colors duration-300 rounded-lg";
+  const lightPanelClasses = "bg-white border border-gray-200 shadow-sm";
+  const darkPanelClasses = "dark:bg-slate-800/50 dark:border-cyan-400/30 dark:shadow-cyan-500/10"; // Example dark panel
+
+  // Specific "cyber" styles might need to be conditionally applied or adjusted with dark: variants
+  // For example, a button might be:
+  // className={`px-2 py-1 rounded text-xs font-mono ${pwnagotchiState.mode === mode ? 'bg-sky-500 text-white dark:bg-cyan-400/20 dark:text-cyan-300' : 'bg-gray-200 hover:bg-gray-300 dark:bg-slate-700 dark:hover:bg-slate-600'}`}
+
   return (
-    <div className="min-h-screen bg-black text-cyan-400 cyber-matrix">
+    <div className={`${baseAppClasses} ${lightAppClasses} ${darkAppClasses}`}>
       <motion.header 
         initial={{ y: -100 }}
         animate={{ y: 0 }}
-        className="cyber-panel border-b border-cyan-400/30 p-4"
+        className={`${basePanelClasses} ${lightPanelClasses} ${darkPanelClasses} p-4 border-b`} // Removed dark:border-cyan-400/30 from here as it's in darkPanelClasses
       >
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-4">
             <motion.div
               animate={{ rotate: 360 }}
               transition={{ duration: 10, repeat: Infinity, ease: "linear" }}
-              className="w-12 h-12 cyber-hexagon bg-gradient-to-r from-cyan-400 to-magenta-500 flex items-center justify-center"
+              className="w-12 h-12 bg-gradient-to-r from-sky-500 to-indigo-600 dark:from-cyan-400 dark:to-magenta-500 flex items-center justify-center rounded-full shadow-lg" // Adjusted for light/dark
             >
-              <Shield className="w-6 h-6 text-black" />
+              <Shield className="w-6 h-6 text-white dark:text-black" />
             </motion.div>
             <div>
-              <h1 className="text-2xl font-bold cyber-glow font-orbitron">PWNAGOTCHI</h1>
-              <p className="text-sm text-cyan-300">CYBER WARFARE INTERFACE v3.0</p>
+              <h1 className="text-2xl font-bold font-orbitron text-sky-700 dark:text-cyan-400 dark:cyber-glow">PWNAGOTCHI</h1>
+              <p className="text-sm text-sky-600 dark:text-cyan-300">CYBER WARFARE INTERFACE v3.0</p>
             </div>
           </div>
 
-          <div className="flex items-center space-x-6">
+          <div className="flex items-center space-x-4 md:space-x-6"> {/* Adjusted spacing for more items */}
             <div className="flex items-center space-x-2">
               <div className={`w-3 h-3 rounded-full ${
-                pwnagotchiState.status === 'active' ? 'bg-green-400 cyber-pulse' : 'bg-red-400'
+                // Use pwnagotchiState.status or isConnected from usePwnagotchi for more accurate online status
+                (pwnagotchiState.status === 'connected_ws' || pwnagotchiState.status === 'active' || pwnagotchiState.status === 'loaded_http') ? 'bg-green-400 dark:bg-green-500 cyber-pulse' : 'bg-red-400 dark:bg-red-600'
               }`} />
-              <span className="text-sm font-mono">
-                {pwnagotchiState.status.toUpperCase()}
+              <span className="text-sm font-mono text-slate-700 dark:text-cyan-300">
+                {/* More descriptive online status */}
+                {(pwnagotchiState.status === 'connected_ws' || pwnagotchiState.status === 'active' || pwnagotchiState.status === 'loaded_http') ? 'ONLINE' : pwnagotchiState.status.toUpperCase().replace('_WS','').replace('_HTTP_FETCH','')}
               </span>
             </div>
 
-            <div className="text-sm font-mono">
+            {handshakeData && handshakeData.length > 0 && (
+              <div className="text-sm font-mono text-slate-700 dark:text-cyan-300 hidden md:block">
+                LAST HANDSHAKE: {new Date(handshakeData[0].timestamp).toLocaleTimeString()}
+                {/* Assuming handshakeData is sorted newest first and has a timestamp field */}
+              </div>
+            )}
+
+            <div className="text-sm font-mono text-slate-700 dark:text-cyan-300 hidden lg:block"> {/* Hide on smaller screens */}
               UPTIME: {formatUptime(pwnagotchiState.uptime)}
             </div>
 
@@ -121,6 +147,16 @@ const PwnagotchiDashboard = () => {
             >
               <Power className="w-4 h-4 mr-2" />
               {pwnagotchiState.status === 'active' ? 'DEACTIVATE' : 'ACTIVATE'}
+            </Button>
+
+            <Button
+              onClick={toggleTheme}
+              variant="ghost"
+              size="icon"
+              className="cyber-button text-cyan-400 hover:text-cyan-300"
+              aria-label="Toggle theme"
+            >
+              {theme === 'dark' ? <Sun className="w-5 h-5" /> : <Moon className="w-5 h-5" />}
             </Button>
           </div>
         </div>
