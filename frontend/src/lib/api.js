@@ -1,6 +1,7 @@
 // api.js (Production-Ready: Only Real API Calls)
 
-const API_BASE = process.env.REACT_APP_API_URL || '/api';
+// Vite uses import.meta.env for environment variables
+const API_BASE = import.meta.env.VITE_API_URL || '/api';
 
 // Helper for GET requests
 async function get(endpoint, params = {}) {
