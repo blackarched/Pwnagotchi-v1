@@ -91,4 +91,32 @@ services:
     ports:
       - "8666:8666" # Expose mock server port for direct inspection if needed
     # No restart policy, typically only run during tests
-# Removed default network, using pwnagotchi_net instead
+
+  prometheus:
+    image: prom/prometheus:v2.47.0 # Use a specific version
+    container_name: pwnagotchi-prometheus
+    restart: unless-stopped
+    ports:
+      - "${PROMETHEUS_PORT:-9090}:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      # Optional: Persist Prometheus data
+      # - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/usr/share/prometheus/console_libraries'
+      - '--web.console.templates=/usr/share/prometheus/consoles'
+    networks:
+      - pwnagotchi_net
+    depends_on:
+      - backend
+
+# Optional: Define prometheus-data volume if you want to persist its data
+# volumes:
+#   redis-data:
+#     driver: local
+#   prometheus-data:
+#     driver: local
+# Removed default network, using pwnagotchi_net instead.
+# Ensure prometheus-data is added to volumes list if uncommented above.

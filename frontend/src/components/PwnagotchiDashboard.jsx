@@ -34,18 +34,28 @@ const PwnagotchiDashboard = () => {
   const [activeTab, setActiveTab] = useState('overview');
   const {
     pwnagotchiState,
-    networkData,
-    handshakeData,
-    handshakeHistory,
-    systemLogs,
+    networks, // Renamed from networkData
+    handshakes, // Renamed from handshakeData, this is the list of handshake objects
+    systemLogs, // Was correctly named
     plugins,
     config,
-    sendCommand,
+    // sendCommand, // Replaced by sendCommandViaHttp or sendCommandViaWebSocket
+    sendCommandViaHttp,
+    sendCommandViaWebSocket,
     updatePlugin,
     saveConfig,
     startDeauthAttack,
-    setConfig,
+    // setConfig, // This is usually a direct state setter, not from the hook's public API typically
+    isConnected, // Added isConnected
+    handshakeHistory, // Was correctly named
+    startLogStream, // Added
+    stopLogStream,  // Added
+    clearSystemLogs // Added
   } = usePwnagotchi();
+
+  // Example: Determine if Pwnagotchi is online based on WebSocket connection and pwnagotchiState status
+  const isPwnagotchiOnline = isConnected && pwnagotchiState.status !== 'connecting' && pwnagotchiState.status !== 'error_ws_connect' && pwnagotchiState.status !== 'error_http_fetch';
+
 
   const formatUptime = (seconds) => {
     const hours = Math.floor(seconds / 3600);
@@ -54,22 +64,39 @@ const PwnagotchiDashboard = () => {
     return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
   };
 
+  // Decide whether to use HTTP or WebSocket for commands.
+  // For simple Pwnagotchi CLI commands, HTTP via `sendCommandViaHttp` might be fine if the backend `/v1/command` route supports it.
+  // Or, use `sendCommandViaWebSocket` if the backend's `client_command` handler is more generic.
+  // Let's assume `sendCommandViaHttp` is for the existing `/v1/command` endpoint.
   const handleModeChange = (mode) => {
-    sendCommand(`mode ${mode}`);
+    sendCommandViaHttp(`mode ${mode}`); // Or sendCommandViaWebSocket({ command: 'mode', value: mode });
     toast({
       title: "Mode Change Requested",
-      description: `Requesting to set Pwnagotchi mode to ${mode}`,
+      description: `Requesting Pwnagotchi mode to ${mode}.`,
     });
   };
 
   const handleStatusToggle = () => {
-    const command = pwnagotchiState.status === 'active' ? 'stop' : 'start';
-    sendCommand(command);
+    // This command might be Pwnagotchi specific, e.g. 'service pwnagotchi start/stop' or an API call.
+    // For now, assuming it's a high-level command the Pwnagotchi understands via its existing command endpoint.
+    const command = pwnagotchiState.status === 'active' ? 'stop' : 'start'; // 'active' status needs confirmation
+    sendCommandViaHttp(command); // Or sendCommandViaWebSocket({ command: command });
     toast({
       title: `Pwnagotchi ${command.charAt(0).toUpperCase() + command.slice(1)} Requested`,
       description: `Requesting to ${command} the Pwnagotchi service.`,
     });
   };
+
+  // Effect to start log stream when terminal tab is active, and stop when inactive or component unmounts
+  useEffect(() => {
+    if (activeTab === 'terminal') {
+      startLogStream(); // Default log file and lines
+      return () => {
+        stopLogStream();
+      };
+    }
+  }, [activeTab, startLogStream, stopLogStream]);
+
 
   const tabs = [
     { id: 'overview', label: 'OVERVIEW', icon: Activity },
@@ -119,30 +146,29 @@ const PwnagotchiDashboard = () => {
           <div className="flex items-center space-x-4 md:space-x-6"> {/* Adjusted spacing for more items */}
             <div className="flex items-center space-x-2">
               <div className={`w-3 h-3 rounded-full ${
-                // Use pwnagotchiState.status or isConnected from usePwnagotchi for more accurate online status
-                (pwnagotchiState.status === 'connected_ws' || pwnagotchiState.status === 'active' || pwnagotchiState.status === 'loaded_http') ? 'bg-green-400 dark:bg-green-500 cyber-pulse' : 'bg-red-400 dark:bg-red-600'
+                isPwnagotchiOnline ? 'bg-green-400 dark:bg-green-500 cyber-pulse' : 'bg-red-400 dark:bg-red-600'
               }`} />
               <span className="text-sm font-mono text-slate-700 dark:text-cyan-300">
-                {/* More descriptive online status */}
-                {(pwnagotchiState.status === 'connected_ws' || pwnagotchiState.status === 'active' || pwnagotchiState.status === 'loaded_http') ? 'ONLINE' : pwnagotchiState.status.toUpperCase().replace('_WS','').replace('_HTTP_FETCH','')}
+                {isPwnagotchiOnline ? 'ONLINE' : (isConnected ? pwnagotchiState.status?.toUpperCase().replace('_WS','').replace('_HTTP_FETCH','') : 'OFFLINE') }
               </span>
             </div>
 
-            {handshakeData && handshakeData.length > 0 && (
+            {/* Use the `handshakes` list (which is the list of handshake objects) */}
+            {handshakes && handshakes.length > 0 && handshakes[0].timestamp && (
               <div className="text-sm font-mono text-slate-700 dark:text-cyan-300 hidden md:block">
-                LAST HANDSHAKE: {new Date(handshakeData[0].timestamp).toLocaleTimeString()}
-                {/* Assuming handshakeData is sorted newest first and has a timestamp field */}
+                LAST HANDSHAKE: {new Date(handshakes[0].timestamp).toLocaleTimeString()}
               </div>
             )}
 
             <div className="text-sm font-mono text-slate-700 dark:text-cyan-300 hidden lg:block"> {/* Hide on smaller screens */}
-              UPTIME: {formatUptime(pwnagotchiState.uptime)}
+              UPTIME: {formatUptime(pwnagotchiState.uptime || 0)}
             </div>
 
+            {/* The definition of 'active' for pwnagotchiState.status might need to be confirmed from actual device states */}
             <Button
               onClick={handleStatusToggle}
               className={`cyber-button text-sm px-3 py-1 ${
-                pwnagotchiState.status === 'active' ? 'cyber-button-destructive' : 'cyber-button-success'
+                pwnagotchiState.status === 'active' || pwnagotchiState.mode === 'auto' || pwnagotchiState.mode === 'ai' ? 'cyber-button-destructive' : 'cyber-button-success'
               }`}
             >
               <Power className="w-4 h-4 mr-2" />
@@ -167,18 +193,24 @@ const PwnagotchiDashboard = () => {
         animate={{ opacity: 1 }}
         transition={{ delay: 0.2 }}
         className="cyber-panel border-b border-cyan-400/30 p-2"
+        role="navigation" // Added role for navigation landmark
       >
-        <div className="flex space-x-1">
+        <div role="tablist" aria-label="Dashboard sections" className="flex space-x-1">
           {tabs.map((tab) => {
             const Icon = tab.icon;
+            const isSelected = activeTab === tab.id;
             return (
               <motion.button
                 key={tab.id}
+                role="tab"
+                aria-selected={isSelected}
+                aria-controls={`tabpanel-${tab.id}`}
+                tabIndex={isSelected ? 0 : -1} // Basic roving tabindex, more complex logic might be needed for arrow key nav
                 whileHover={{ scale: 1.05 }}
                 whileTap={{ scale: 0.95 }}
                 onClick={() => setActiveTab(tab.id)}
                 className={`flex items-center space-x-2 px-3 py-1.5 rounded cyber-button font-mono text-xs transition-all ${
-                  activeTab === tab.id 
+                  isSelected
                     ? 'bg-cyan-400/20 text-cyan-400 border-cyan-400' 
                     : 'text-cyan-300 hover:text-cyan-400'
                 }`}
@@ -192,8 +224,12 @@ const PwnagotchiDashboard = () => {
       </motion.nav>
 
       <main className="p-6 h-[calc(100vh-140px)] overflow-hidden">
+        {/* Tab Panel Content - each should have role="tabpanel" and id matching aria-controls */}
         {activeTab === 'overview' && (
           <motion.div
+            id="tabpanel-overview"
+            role="tabpanel"
+            aria-labelledby="overview" // Assuming tab button itself can be label, or add aria-label
             initial={{ opacity: 0, y: 20 }}
             animate={{ opacity: 1, y: 0 }}
             className="grid grid-cols-1 lg:grid-cols-3 gap-6 h-full"
@@ -201,7 +237,7 @@ const PwnagotchiDashboard = () => {
             <div className="lg:col-span-1 space-y-6">
               <div className="cyber-panel rounded-lg p-6 text-center">
                 <PwnagotchiFace mood={pwnagotchiState.mood} />
-                <div className="mt-4 h-10 flex items-center justify-center">
+                <div className="mt-4 h-10 flex items-center justify-center" aria-live="polite" aria-atomic="true">
                   <p className="text-sm text-cyan-300 font-mono cyber-flicker">
                     {pwnagotchiState.last_log}
                   </p>
@@ -242,21 +278,18 @@ const PwnagotchiDashboard = () => {
               </div>
               <div className="cyber-panel rounded-lg p-6">
                 <h2 className="text-xl font-bold mb-4 cyber-glow">SYSTEM LOGS</h2>
-                <div className="h-full overflow-y-auto scrollbar-cyber cyber-terminal rounded p-4">
-                  {systemLogs.map(log => (
+                {/* System logs are now an array of strings, map them directly */}
+                {/* Consider enhancing TerminalInterface to accept an array of log strings if it doesn't already */}
+                <div className="h-full overflow-y-auto scrollbar-cyber cyber-terminal rounded p-4 text-xs">
+                  {systemLogs.map((logLine, index) => (
                     <motion.div
-                      key={log.id}
-                      initial={{ opacity: 0, x: -20 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      className="flex items-center space-x-3 py-1 text-sm font-mono"
+                      key={index} // Using index as key for log lines; consider unique IDs if available
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      transition={{ duration: 0.2 }}
+                      className="font-mono whitespace-pre-wrap" // whitespace-pre-wrap to respect newlines from log
                     >
-                      <span className="text-cyan-300 text-xs">{new Date(log.timestamp).toLocaleTimeString()}</span>
-                      <span className={`px-2 py-1 rounded text-xs ${
-                        log.level === 'INFO' ? 'bg-blue-500/20 text-blue-400' : 
-                        log.level === 'WARN' ? 'bg-yellow-500/20 text-yellow-400' :
-                        log.level === 'ERROR' ? 'bg-red-500/20 text-red-400' :
-                        'bg-green-500/20 text-green-400'}`}>{log.level}</span>
-                      <span className="text-cyan-400">{log.message}</span>
+                      {logLine}
                     </motion.div>
                   ))}
                 </div>
@@ -265,12 +298,29 @@ const PwnagotchiDashboard = () => {
           </motion.div>
         )}
 
-        {activeTab === 'network' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><NetworkMap networks={networkData} fullscreen /></motion.div>}
-        {activeTab === 'handshakes' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><HandshakeCapture handshakes={handshakeData} /></motion.div>}
-        {activeTab === 'advanced' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><AdvancedTools networks={networkData} onStartAttack={startDeauthAttack} /></motion.div>}
+        {/* Updated props for child components based on hook changes */}
+        {activeTab === 'network' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><NetworkMap networks={networks} fullscreen /></motion.div>}
+        {activeTab === 'handshakes' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><HandshakeCapture handshakes={handshakes} /></motion.div>}
+        {activeTab === 'advanced' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><AdvancedTools networks={networks} onStartAttack={startDeauthAttack} /></motion.div>}
         {activeTab === 'plugins' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><PluginManager plugins={plugins} onTogglePlugin={updatePlugin} /></motion.div>}
-        {activeTab === 'config' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><ConfigPanel config={config} onSave={saveConfig} setConfig={setConfig} /></motion.div>}
-        {activeTab === 'terminal' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><TerminalInterface logs={systemLogs} onSendCommand={sendCommand} /></motion.div>}
+        {activeTab === 'config' && <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full"><ConfigPanel initialConfig={config} onSave={saveConfig} /></motion.div>} {/* Changed prop name to initialConfig */}
+        {/* For TerminalInterface, decide if it should use sendCommandViaHttp or sendCommandViaWebSocket */}
+        {/* It also needs to display systemLogs (which are now strings) or have a dedicated log view component */}
+        {activeTab === 'terminal' && (
+          <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} className="h-full">
+            <TerminalInterface
+              logs={systemLogs} // Pass the string array of logs
+              onSendCommand={sendCommandViaWebSocket} // Example: using WebSocket for terminal commands
+              // onSendCommand={sendCommandViaHttp} // Or HTTP
+              // Consider adding buttons to start/stop log stream here if not global
+            />
+            <div className="mt-2 flex space-x-2">
+                <Button onClick={() => startLogStream()} className="cyber-button">Start Log Stream</Button>
+                <Button onClick={stopLogStream} className="cyber-button cyber-button-destructive">Stop Log Stream</Button>
+                <Button onClick={clearSystemLogs} className="cyber-button">Clear Displayed Logs</Button>
+            </div>
+          </motion.div>
+        )}
       </main>
     </div>
   );

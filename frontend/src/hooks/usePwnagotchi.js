@@ -20,12 +20,16 @@ export default function usePwnagotchi() {
     last_log: 'Initializing connection...'
   });
   const [networks, setNetworks] = useState([]);
-  const [handshakes, setHandshakes] = useState([]);
-  const [logs, setLogs] = useState([]);
-  const [plugins, setPlugins] = useState([]);
-  const [config, setConfig] = useState({});
-  const [inbox, setInbox] = useState([]);
+  const [networks, setNetworks] = useState([]); // List of discovered networks
+  const [handshakes, setHandshakes] = useState([]); // List of captured handshakes
+  const [systemLogs, setSystemLogs] = useState([]); // For Pwnagotchi system logs (streamed)
+  const [plugins, setPlugins] = useState([]); // List of Pwnagotchi plugins and their status
+  const [config, setConfig] = useState({}); // Pwnagotchi configuration object
+  const [inbox, setInbox] = useState([]); // For Pwnmail/mesh messaging
   const [loading, setLoading] = useState(true);
+  const [handshakeHistory, setHandshakeHistory] = useState([]); // For the HandshakeChart component
+
+  const MAX_LOG_LINES = 200; // Max number of system log lines to keep in state
   const [error, setError] = useState(null);
   const [isConnected, setIsConnected] = useState(false);
   const socketRef = useRef(null);
@@ -46,17 +50,24 @@ export default function usePwnagotchi() {
           api.fetchConfig().catch(e => { logger.error('Failed to fetch initial config:', e); return {}; }),
           api.fetchPlugins().catch(e => { logger.error('Failed to fetch initial plugins:', e); return []; }),
           api.fetchInbox().catch(e => { logger.error('Failed to fetch initial inbox:', e); return []; }),
-          api.fetchLogs().catch(e => { logger.error('Failed to fetch initial logs:', e); return []; }), // For initial log view
+          // Initial system logs are not typically fetched via HTTP; they will come via WebSocket.
+          // api.fetchLogs().catch(e => { logger.error('Failed to fetch initial logs:', e); return []; }),
         ]);
 
         if (isMounted) {
           if (initialPwnagotchiState) setPwnagotchiState(s => ({ ...s, ...initialPwnagotchiState, status: s.status === 'connecting' ? 'loaded_http' : s.status }));
-          setNetworks(initialNetworks);
-          setHandshakes(initialHandshakes); // This will be quickly updated by WS if connected
-          setConfig(initialConfig);
-          setPlugins(initialPlugins);
-          setInbox(initialInbox);
-          setLogs(initialLogs);
+          setNetworks(initialNetworks || []);
+          setHandshakes(initialHandshakes || []); // This will be quickly updated by WS if connected
+          // Populate handshakeHistory from initialHandshakes for the chart
+          if (initialHandshakes && initialHandshakes.length > 0) {
+            const history = initialHandshakes.map(h => ({ time: new Date(h.timestamp).toLocaleTimeString(), count: 1 })); // Simplified initial history
+            // More sophisticated aggregation might be needed if timestamps are very close
+            setHandshakeHistory(history.slice(-30)); // Keep last 30 points for chart
+          }
+          setConfig(initialConfig || {});
+          setPlugins(initialPlugins || []);
+          setInbox(initialInbox || []);
+          // setSystemLogs(initialLogs || []); // Not fetching initial logs this way
           setError(null);
         }
       } catch (err) {
@@ -112,27 +123,82 @@ export default function usePwnagotchi() {
       setPwnagotchiState(s => ({ ...s, last_log: data.message || JSON.stringify(data) }));
     });
 
-    socket.on('handshakes:update', (newHandshakes) => {
-      logger.debug('Received handshakes:update', newHandshakes);
-      setHandshakes(newHandshakes);
-      // Update handshake count in pwnagotchiState if it's part of the main status object
-      setPwnagotchiState(s => ({ ...s, handshakes: newHandshakes.length }));
+    socket.on('handshakes:update', (updatedHandshakes) => {
+      logger.debug('Received handshakes:update', updatedHandshakes);
+      setHandshakes(updatedHandshakes);
+      setPwnagotchiState(s => ({ ...s, handshakes: updatedHandshakes.length }));
+      // Update handshake history for the chart
+      // This is a simple way to add to history; might need more sophisticated time-based aggregation
+      if (updatedHandshakes.length > 0) {
+        // Assuming new handshakes are appended or the list is a full refresh
+        // For simplicity, let's assume `updatedHandshakes` contains new ones since last update or is the full list
+        // A more robust approach would be to diff or look for new entries specifically.
+        const newHistoryPoint = { time: new Date().toLocaleTimeString(), count: updatedHandshakes.length };
+        setHandshakeHistory(prevHistory => [...prevHistory.slice(-29), newHistoryPoint]);
+      }
     });
 
-    socket.on('networks:update', (newNetworks) => {
-      logger.debug('Received networks:update', newNetworks);
-      setNetworks(newNetworks);
-      setPwnagotchiState(s => ({ ...s, networks: newNetworks.length }));
+    // This event should be 'handshakes:capture' if we want to capture individual new ones for the chart history
+    socket.on('handshakes:capture', (newHandshake) => {
+        logger.debug('Received handshakes:capture', newHandshake);
+        // Add to main handshakes list (assuming newHandshake is a single object)
+        setHandshakes(prev => [newHandshake, ...prev]);
+        setPwnagotchiState(s => ({ ...s, handshakes: s.handshakes + 1 }));
+
+        // Update history for chart (count of 1 for each new capture)
+        const newHistoryPoint = { time: new Date(newHandshake.timestamp || Date.now()).toLocaleTimeString(), count: 1 };
+         setHandshakeHistory(prevHistory => {
+            // Simple aggregation: if last point was in same second, increment its count
+            // This is very basic, real charting might need time-window based aggregation
+            if (prevHistory.length > 0 && prevHistory[prevHistory.length -1].time === newHistoryPoint.time) {
+                const lastPoint = {...prevHistory[prevHistory.length-1]};
+                lastPoint.count +=1;
+                return [...prevHistory.slice(0, -1), lastPoint].slice(-30);
+            }
+            return [...prevHistory, newHistoryPoint].slice(-30);
+        });
+    });
+
+
+    socket.on('networks:update', (updatedNetworks) => {
+      logger.debug('Received networks:update', updatedNetworks);
+      setNetworks(updatedNetworks);
+      setPwnagotchiState(s => ({ ...s, networks: updatedNetworks.length }));
     });
 
     socket.on('ai:status', (newAIStatus) => {
       logger.debug('Received ai:status', newAIStatus);
-      // Assuming newAIStatus contains fields like { mood, epoch, last_log, etc. }
-      // Merge it into the existing pwnagotchiState
       setPwnagotchiState(s => ({ ...s, ...newAIStatus, status: 'connected_ws' }));
     });
 
-    // TODO: Add listener for 'logs:new' if backend implements log streaming
+    // Listener for Pwnagotchi logs
+    socket.on('pwnagotchi:log', (logEntry) => {
+      // logger.debug('Received pwnagotchi:log', logEntry); // Can be very verbose
+      setSystemLogs(prevLogs => {
+        const newLogs = [...prevLogs, logEntry.line || JSON.stringify(logEntry)];
+        return newLogs.length > MAX_LOG_LINES ? newLogs.slice(newLogs.length - MAX_LOG_LINES) : newLogs;
+      });
+    });
+    socket.on('pwnagotchi:log:error', (errorEntry) => {
+      logger.error('Received pwnagotchi:log:error', errorEntry);
+      setSystemLogs(prevLogs => {
+        const newLogs = [...prevLogs, `[LOG ERROR] ${errorEntry.error || JSON.stringify(errorEntry)}`];
+        return newLogs.length > MAX_LOG_LINES ? newLogs.slice(newLogs.length - MAX_LOG_LINES) : newLogs;
+      });
+    });
+     socket.on('pwnagotchi:logs:stream_started', (status) => {
+        logger.info('Pwnagotchi log stream started:', status);
+        setSystemLogs(prev => [...prev, `[INFO] Log stream started for ${status.logFile}`]);
+    });
+    socket.on('pwnagotchi:logs:stream_stopped', (status) => {
+        logger.info('Pwnagotchi log stream stopped:', status);
+        setSystemLogs(prev => [...prev, `[INFO] Log stream stopped. ${status.message}`]);
+    });
+    socket.on('pwnagotchi:logs:stream_ended', (status) => {
+        logger.info('Pwnagotchi log stream ended by backend:', status);
+        setSystemLogs(prev => [...prev, `[INFO] Log stream ended by backend. ${status.message}`]);
+    });
+
 
     return () => {
       logger.info('Cleaning up WebSocket connection.');
@@ -144,30 +210,90 @@ export default function usePwnagotchi() {
   }, []);
 
 
-  // Actions (remain largely the same, but might trigger UI updates that reflect WS changes indirectly)
-  const sendCommand = useCallback(async (command) => {
-    // Could also send commands via WebSocket if backend supports it
-    await api.sendCommand(command);
-    // Optionally, backend could confirm command execution via a WS message
+  // Actions
+  const sendCommandViaHttp = useCallback(async (command) => { // Renamed from sendCommand
+    // For commands that go via HTTP POST to /api/v1/command
+    try {
+      const response = await api.sendCommand(command);
+      // Optionally update pwnagotchiState or other state based on response
+      setPwnagotchiState(s => ({ ...s, last_log: `Command '${command}' sent. Response: ${JSON.stringify(response)}` }));
+      return response;
+    } catch (err) {
+      logger.error(`Error sending command '${command}' via HTTP:`, err);
+      setError(err.message);
+      setPwnagotchiState(s => ({ ...s, last_log: `Error sending command '${command}'.` }));
+      throw err;
+    }
   }, []);
 
+  const sendCommandViaWebSocket = useCallback((commandPayload) => {
+    // For commands that should be sent over WebSocket (e.g. to 'client_command' handler on backend)
+    if (socketRef.current && isConnected) {
+      socketRef.current.emit('client_command', commandPayload); // commandPayload might be { command: "...", params: ... }
+      setPwnagotchiState(s => ({ ...s, last_log: `Command sent via WS: ${JSON.stringify(commandPayload)}` }));
+    } else {
+      logger.warn('Socket not connected. Cannot send command via WebSocket.');
+      setError('Socket not connected for WS command.');
+    }
+  }, [isConnected]);
+
+
+  const startLogStream = useCallback((logFile = '/var/log/pwnagotchi.log', lines = 50) => {
+    if (socketRef.current && isConnected) {
+      setSystemLogs([`[INFO] Attempting to start log stream for ${logFile}...`]); // Clear previous logs
+      socketRef.current.emit('pwnagotchi:logs:start_stream', { logFile, lines });
+    } else {
+      logger.warn('Socket not connected. Cannot start log stream.');
+    }
+  }, [isConnected]);
+
+  const stopLogStream = useCallback(() => {
+    if (socketRef.current && isConnected) {
+      socketRef.current.emit('pwnagotchi:logs:stop_stream');
+    } else {
+      logger.warn('Socket not connected. Cannot stop log stream.');
+    }
+  }, [isConnected]);
+
+
   const updatePlugin = useCallback(async (plugin, enabled) => {
-    await api.updatePlugin(plugin, enabled);
-    // Backend could emit a 'plugins:update' event
+    // Assumes this goes via HTTP API
+    try {
+      await api.updatePlugin(plugin, enabled);
+      // Optimistically update local state or wait for a 'plugins:update' WS event
+      setPlugins(prevPlugins => prevPlugins.map(p => p.name === plugin ? { ...p, status: enabled ? 'enabled' : 'disabled' } : p));
+      // Or, better: fetchPlugins(); // if backend confirms and then we re-fetch
+    } catch (err) {
+      logger.error('Error updating plugin:', err);
+      setError(err.message); // Show error to user
+    }
   }, []);
 
   const saveConfig = useCallback(async (newConfig) => {
-    await api.saveConfig(newConfig);
-    setConfig(newConfig); // Optimistic update
-    // Backend could confirm save and emit 'config:update'
+    try {
+      await api.saveConfig(newConfig);
+      setConfig(newConfig); // Optimistic update
+      // toast({ title: "Config saved", description: "Pwnagotchi configuration updated."});
+    } catch (err) {
+      logger.error('Error saving config:', err);
+      setError(err.message);
+    }
   }, []);
 
+  // Example: startDeauthAttack might now be a generic 'execute_tool' command via WebSocket or specific API
   const startDeauthAttack = useCallback(async (target) => {
-    await api.startDeauthAttack(target);
-    // Backend could emit 'attack:status' or log events
+    try {
+      // This specific action might change to a more generic Pwnagotchi command
+      // or a specific API endpoint if available.
+      await api.startDeauthAttack(target);
+      // Or: sendCommandViaWebSocket({ command: 'deauth', target: target });
+    } catch (err) {
+      logger.error('Error starting deauth attack:', err);
+      setError(err.message);
+    }
   }, []);
 
-  // Helper for logging within the hook, as console from here might not always be visible
+  // Helper for logging within the hook
   const logger = {
     info: (...args) => console.log('[usePwnagotchi INFO]', ...args),
     warn: (...args) => console.warn('[usePwnagotchi WARN]', ...args),
@@ -175,19 +301,28 @@ export default function usePwnagotchi() {
     debug: (...args) => console.debug('[usePwnagotchi DEBUG]', ...args),
   };
 
+  // Returned state and functions
   return {
-    pwnagotchiState, // Renamed from 'state'
+    pwnagotchiState,
     networks,
-    handshakes,
-    logs,
+    handshakes, // This is the list of handshake objects
+    systemLogs, // Renamed from 'logs' for clarity
     plugins,
     config,
     inbox,
     loading,
     error,
-    sendCommand,
+    isConnected,
+    handshakeHistory, // For the chart
+
+    sendCommandViaHttp, // Explicitly named
+    sendCommandViaWebSocket, // For WS commands
     updatePlugin,
     saveConfig,
-    startDeauthAttack,
+    startDeauthAttack, // This might be refactored/removed depending on Pwnagotchi capabilities
+
+    startLogStream,
+    stopLogStream,
+    clearSystemLogs: () => setSystemLogs([]),
   };
 }

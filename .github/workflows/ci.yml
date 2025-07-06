@@ -1,0 +1,216 @@
+name: Pwnagotchi Dashboard CI/CD
+
+on:
+  push:
+    branches:
+      - main
+      - develop # Or your main development branch
+  pull_request:
+    branches:
+      - main
+      - develop
+
+jobs:
+  lint-test-build:
+    name: Lint, Test & Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18' # Match .nvmrc or project requirement
+          cache: 'npm'
+          cache-dependency-path: | # Cache both frontend and backend lock files
+            ./frontend/package-lock.json
+            ./backend/package-lock.json
+            ./package-lock.json
+
+      - name: Install Root Dependencies (Playwright, etc.)
+        run: npm ci --ignore-scripts # --ignore-scripts if playwright install browsers is separate
+        # Or if you prefer to install Playwright browsers during CI:
+        # run: npm ci && npx playwright install --with-deps
+
+      - name: Install Backend Dependencies
+        run: cd backend && npm ci
+
+      - name: Install Frontend Dependencies
+        run: cd frontend && npm ci
+
+      - name: Lint Backend
+        run: cd backend && npm run lint
+
+      - name: Lint Frontend
+        # Assuming frontend has a lint script, e.g., "lint": "eslint . --ext js,jsx"
+        # If not, add one or run eslint directly: npx eslint frontend/src --ext .js,.jsx
+        run: cd frontend && npm run lint # Add lint script to frontend/package.json if missing
+
+      - name: Test Backend (Unit & Coverage)
+        run: cd backend && npm test # This runs "jest --coverage"
+        # Jest will fail if coverage thresholds in package.json are not met
+
+      - name: Test Frontend (Unit & Coverage)
+        run: cd frontend && npm run coverage # This runs "vitest run --coverage"
+        # Vitest will fail if coverage thresholds in vitest.config.js are not met
+
+      # E2E tests require Docker, so they might run in a separate job or after build if they test containers
+      # For now, keeping it simple. If running E2E here, ensure Docker is available.
+      # - name: Run E2E Tests (Playwright)
+      #   run: npm run test:e2e # Assumes services (docker-compose) are started if needed by tests
+
+      - name: Build Backend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: false # Don't push yet
+          tags: pwnagotchi-backend-ci:${{ github.sha }}
+          # cache-from: type=gha # Optional: Cache Docker layers
+          # cache-to: type=gha,mode=max # Optional
+
+      - name: Build Frontend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.frontend
+          push: false # Don't push yet
+          tags: pwnagotchi-frontend-ci:${{ github.sha }}
+          build-args: | # Pass Vite build arguments
+            VITE_API_URL=${{ secrets.VITE_API_URL_PROD || '/api' }}
+            VITE_WS_URL=${{ secrets.VITE_WS_URL_PROD || '' }}
+            VITE_WEBSOCKET_PATH=${{ secrets.VITE_WEBSOCKET_PATH_PROD || '/socket.io' }}
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+
+      - name: Scan Backend Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pwnagotchi-backend-ci:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1' # Fail on critical/high vulnerabilities
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+      - name: Scan Frontend Image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: 'pwnagotchi-frontend-ci:${{ github.sha }}'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+          severity: 'CRITICAL,HIGH'
+
+  deploy:
+    name: Deploy to Production (K8s)
+    needs: lint-test-build # Run only if lint-test-build job succeeds
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' # Deploy only on push to main
+    runs-on: ubuntu-latest
+    environment: production # Optional: if you have GitHub environments configured
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Configure Docker Hub login (or your private registry)
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Alternatively, for GHCR (GitHub Container Registry)
+      # - name: Login to GitHub Container Registry
+      #   uses: docker/login-action@v3
+      #   with:
+      #     registry: ghcr.io
+      #     username: ${{ github.actor }}
+      #     password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set Docker Image Tags
+        id: docker_tags
+        run: |
+          echo "backend_image=yourdockerhubusername/pwnagotchi-backend" >> $GITHUB_OUTPUT
+          echo "frontend_image=yourdockerhubusername/pwnagotchi-frontend" >> $GITHUB_OUTPUT
+          # For GHCR:
+          # echo "backend_image=ghcr.io/${{ github.repository_owner }}/pwnagotchi-backend" >> $GITHUB_OUTPUT
+          # echo "frontend_image=ghcr.io/${{ github.repository_owner }}/pwnagotchi-frontend" >> $GITHUB_OUTPUT
+          echo "version=v${{ github.run_number }}-${{ github.sha }}" >> $GITHUB_OUTPUT # Example version tag
+
+      - name: Build and Push Backend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.docker_tags.outputs.backend_image }}:${{ steps.docker_tags.outputs.version }}
+            ${{ steps.docker_tags.outputs.backend_image }}:latest
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+
+      - name: Build and Push Frontend Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile.frontend
+          push: true
+          tags: |
+            ${{ steps.docker_tags.outputs.frontend_image }}:${{ steps.docker_tags.outputs.version }}
+            ${{ steps.docker_tags.outputs.frontend_image }}:latest
+          build-args: | # Ensure production build args are used
+            VITE_API_URL=${{ secrets.VITE_API_URL_PROD || '/api' }}
+            VITE_WS_URL=${{ secrets.VITE_WS_URL_PROD || '' }} # Usually derived by client, can be empty
+            VITE_WEBSOCKET_PATH=${{ secrets.VITE_WEBSOCKET_PATH_PROD || '/socket.io' }}
+          # cache-from: type=gha
+          # cache-to: type=gha,mode=max
+
+      - name: Set up Kubeconfig
+        # This step depends on how your K8s cluster access is configured (e.g., service account, kubeconfig secret)
+        # Example for GKE:
+        # uses: google-github-actions/get-gke-credentials@v1
+        # with:
+        #   cluster_name: your-cluster-name
+        #   location: your-cluster-location
+        #   project_id: your-gcp-project-id
+        #   credentials: ${{ secrets.GKE_SA_KEY }}
+        run: |
+          echo "Kubeconfig setup placeholder. Configure according to your K8s provider."
+          # mkdir -p $HOME/.kube
+          # echo "${{ secrets.KUBECONFIG_DATA }}" > $HOME/.kube/config # If kubeconfig is stored as a secret
+          # export KUBECONFIG=$HOME/.kube/config
+
+      - name: Deploy to Kubernetes
+        # This assumes you have a kustomization.yaml or just apply the single manifest.
+        # If using Helm, this would be `helm upgrade --install ...`
+        run: |
+          echo "Deploying to Kubernetes..."
+          # kubectl apply -f backend/k8s-deployment.yaml
+          # Or using Kustomize if you have a kustomization.yaml in backend/
+          # kubectl apply -k backend/ # (or a specific k8s overlay directory)
+          echo "Placeholder: kubectl apply -f backend/k8s-deployment.yaml"
+          echo "Remember to update image tags in k8s-deployment.yaml or use Kustomize/Helm for image updates."
+
+      # - name: Slack Notification on Failure
+      #   if: failure()
+      #   uses: rtCamp/action-slack-notify@v2
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+      #     SLACK_MESSAGE: "CI/CD Job Failed: ${env.GITHUB_WORKFLOW} - ${env.GITHUB_JOB}"
+      #     SLACK_TITLE: "Pwnagotchi Dashboard CI - Failure"
+      #     SLACK_COLOR: 'danger'
+
+      # - name: Slack Notification on Success
+      #   if: success()
+      #   uses: rtCamp/action-slack-notify@v2
+      #   env:
+      #     SLACK_WEBHOOK: ${{ secrets.SLACK_WEBHOOK_URL }}
+      #     SLACK_MESSAGE: "CI/CD Job Successful: ${env.GITHUB_WORKFLOW} - Deployed version ${{ steps.docker_tags.outputs.version }}"
+      #     SLACK_TITLE: "Pwnagotchi Dashboard CI - Success"
+      #     SLACK_COLOR: 'good'
+
+[end of .github/workflows/ci.yml]

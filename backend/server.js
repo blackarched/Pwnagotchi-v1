@@ -10,10 +10,12 @@ import { Server as SocketIOServer } from 'socket.io';
 dotenv.config();
 
 // Initialize Pwnagotchi Service (must be after dotenv.config())
-import { initPwnagotchiService } from './lib/pwnagotchiService.js';
+import { initPwnagotchiService, streamPwnagotchiCommand, executePwnagotchiCommand, getPwnagotchiApiData, parseRecentHandshakes, parseUnits, parseAIStatus } from './lib/pwnagotchiService.js';
 initPwnagotchiService();
 
 import promClient from 'prom-client';
+import apiLimiter from './middleware/rateLimiter.js'; // Import the default rate limiter
+// import { sensitiveActionLimiter } from './middleware/rateLimiter.js'; // Import if specific routes need stricter limits
 
 const {
   BACKEND_PORT = 3001,
@@ -46,7 +48,7 @@ const pwnagotchiNetworksDetectedTotal = new promClient.Gauge({
   registers: [register],
 });
 
-const pwnagotchiApiRequestsTotal = new promClient.Counter({
+const pwnagotchiApiRequestsTotal = new promClient.Counter({ // Will be incremented in the middleware
   name: 'pwnagotchi_backend_api_requests_total',
   help: 'Total number of requests to the backend API.',
   labelNames: ['method', 'route', 'status_code'],
@@ -58,6 +60,21 @@ const pwnagotchiWebsocketConnections = new promClient.Gauge({
   help: 'Current number of active WebSocket connections.',
   registers: [register],
 });
+
+const pwnagotchiConnectionStatus = new promClient.Gauge({
+  name: 'pwnagotchi_connection_status',
+  help: 'Connection status to the Pwnagotchi device (1 for connected, 0 for disconnected).',
+  registers: [register],
+});
+// Initialize with disconnected status; polling loop will update it.
+pwnagotchiConnectionStatus.set(0);
+
+const pwnagotchiReportedUptime = new promClient.Gauge({
+  name: 'pwnagotchi_reported_uptime_seconds',
+  help: 'Uptime of the Pwnagotchi device as reported by its status.',
+  registers: [register],
+});
+pwnagotchiReportedUptime.set(0);
 
 
 // Basic check for essential Pwnagotchi connection details for later use
@@ -122,12 +139,48 @@ import gridRouter from './routes/grid.js';
 import mailRouter from './routes/pwnmail.js';
 // import pwnagotchiRouter from './routes/pwnagotchi.js'; // Example for future direct Pwnagotchi control if needed
 
-app.get('/healthz', (req, res) => res.status(200).send('OK')); // Basic health check
+app.get('/healthz', (req, res) => res.status(200).send('OK')); // Basic health check - should NOT be rate limited.
 
-app.use('/api/mesh', meshRouter); // These routes will be refactored to use pwnagotchiService.js
-app.use('/api', gridRouter);     // instead of direct proxying.
-app.use('/api', mailRouter);
-// app.use('/api/pwnagotchi', pwnagotchiRouter);
+// Apply the general API rate limiter to all /api routes
+app.use('/api', apiLimiter);
+
+// Apply new routes (now rate-limited)
+app.use('/api/mesh', meshRouter);
+app.use('/api/grid', gridRouter); // Note: original path was /api, if gridRouter contains /v1/data, it becomes /api/v1/data
+app.use('/api/pwnmail', mailRouter); // Changed from /api to /api/pwnmail for clarity, assuming routes within are like /v1/inbox
+
+// If gridRouter and mailRouter define paths like '/v1/data', they will be mounted at:
+// /api/grid/v1/data
+// /api/pwnmail/v1/inbox
+// This might require adjusting frontend API calls if they previously assumed /api/v1/data directly.
+// For simplicity and to match common patterns, let's assume routes are defined within routers starting from /
+// e.g. gridRouter.get('/v1/data', ...)
+// If routes in grid.js start with /api, then app.use('/', gridRouter) might be used, but that's less common for modular routers.
+// Sticking to the current structure:
+// app.use('/api/mesh', meshRouter);
+// app.use('/api/grid', gridRouter); // If grid.js has router.get('/v1/data'), it's /api/grid/v1/data
+// app.use('/api/pwnmail', mailRouter); // If pwnmail.js has router.get('/v1/inbox'), it's /api/pwnmail/v1/inbox
+
+// Let's adjust how gridRouter and mailRouter are mounted if they contain full paths like /api/v1/*
+// Based on original: app.use('/api', gridRouter); and app.use('/api', mailRouter);
+// This implies gridRouter might have routes like '/v1/data' and mailRouter '/v1/inbox'
+// To apply limiter before these, we need to be careful.
+// If apiLimiter is applied to '/api', it will cover these.
+
+// Re-evaluating the route mounting based on original setup:
+// The original had app.use('/api', gridRouter) and app.use('/api', mailRouter)
+// This means gridRouter's paths like '/v1/data' would be accessible at '/api/v1/data'.
+// And mailRouter's paths like '/v1/inbox' would be accessible at '/api/v1/inbox'.
+// The router for mesh was specific: app.use('/api/mesh', meshRouter);
+
+// Corrected application of routes and limiter:
+app.use('/api/mesh', meshRouter); // Specific, rate limited by the '/api' limiter if meshRouter paths are relative
+                                 // Or apply specific limiter here if needed: app.use('/api/mesh', sensitiveActionLimiter, meshRouter);
+
+// For grid and pwnmail, if their internal routes are /v1/* and they were mounted on /api
+// the apiLimiter on '/api' will cover them.
+app.use('/api', gridRouter);     // Handles routes like /api/v1/data, /api/v1/units
+app.use('/api', mailRouter);     // Handles routes like /api/v1/inbox
 
 
 // error handler
@@ -151,23 +204,111 @@ const io = new SocketIOServer(server, {
 logger.info(`Socket.IO server initialized on path: ${WEBSOCKET_PATH}`);
 
 // Socket.IO connection handling
+// Store active log stream commands per socket to manage them
+const activeStreams = new Map(); // Stores { socketId: { command: "tail -f ...", type: 'log_stream', processPromise: Promise } }
+
+
 io.on('connection', (socket) => {
   logger.info({ msg: 'socket_io_client_connected', id: socket.id, remoteAddress: socket.handshake.address });
-  pwnagotchiWebsocketConnections.inc(); // Increment active connections
+  pwnagotchiWebsocketConnections.inc();
 
-  // Example: Send a welcome message
   socket.emit('server_message', { message: 'Welcome to the Pwnagotchi Dashboard WebSocket!' });
 
-  // Placeholder for handling client commands or messages
-  socket.on('client_command', (data) => {
+  socket.on('client_command', async (data) => { // Made async
     logger.info({ msg: 'socket_io_client_command', id: socket.id, command: data });
-    // Process command, possibly using pwnagotchiService.js
-    // Example: socket.emit('command_response', { status: 'executed', detail: ... });
+    if (data && data.command) {
+      try {
+        const result = await executePwnagotchiCommand(data.command);
+        socket.emit('command_response', { status: 'executed', detail: result, forCommand: data.command });
+      } catch (error) {
+        logger.error(`Error executing client command '${data.command}': ${error.message}`);
+        socket.emit('command_response', { status: 'error', detail: error.message, forCommand: data.command });
+      }
+    } else {
+      socket.emit('command_response', { status: 'error', detail: 'Invalid command format.', forCommand: data.command })
+    }
+  });
+
+  socket.on('pwnagotchi:logs:start_stream', async (data = {}) => {
+    const { logFile = '/var/log/pwnagotchi.log', lines = 50 } = data; // Default log file and initial lines
+    logger.info(`Client ${socket.id} requested log stream for ${logFile} (last ${lines} lines)`);
+
+    if (activeStreams.has(socket.id)) {
+      logger.warn(`Socket ${socket.id} already has an active stream. Stopping the old one (best-effort).`);
+      // Placeholder for robustly killing the previous stream if possible
+      activeStreams.delete(socket.id);
+    }
+
+    try {
+      const tailCommand = `tail -n ${lines} -f ${logFile}`;
+      // streamPwnagotchiCommand is now used. It returns a promise that resolves when the command starts.
+      // The actual stream data is handled by callbacks.
+      const streamProcessPromise = streamPwnagotchiCommand(
+        tailCommand,
+        (stdoutChunk) => { // onStdOut callback
+          socket.emit('pwnagotchi:log', { line: stdoutChunk.trim() });
+        },
+        (stderrChunk) => { // onStdErr callback
+          socket.emit('pwnagotchi:log:error', { error: stderrChunk.trim() });
+          logger.warn(`Pwnagotchi log stream for ${socket.id} (file: ${logFile}) stderr: ${stderrChunk.trim()}`);
+        }
+      );
+
+      activeStreams.set(socket.id, { command: tailCommand, type: 'log_stream', processPromise: streamProcessPromise });
+      socket.emit('pwnagotchi:logs:stream_started', { logFile });
+
+      // Handle the completion or error of the streamPwnagotchiCommand promise itself
+      // This promise resolves when the SSH command execution is established or fails at that stage.
+      // It does NOT wait for `tail -f` to end, because `tail -f` doesn't end on its own.
+      streamProcessPromise.then(sshExecResult => {
+        // This block executes if the `execCommand` itself completed (e.g. if `tail -f` was immediately killed or errored out)
+        // For a long-running `tail -f`, this might indicate an issue if it resolves too quickly without being explicitly stopped.
+        logger.info(`Log stream SSH command for ${socket.id} (file: ${logFile}) finished initial execution. Code: ${sshExecResult.code}. This is unusual for 'tail -f' unless it errored or was pre-emptively killed.`);
+        // We don't delete from activeStreams here necessarily, as the stream might still be technically open
+        // or the stop mechanism might be initiated by the client.
+        // If code is not 0, it means `tail -f` likely failed to start properly.
+        if (sshExecResult.code !== 0) {
+            socket.emit('pwnagotchi:logs:stream_error', { logFile, error: `tail command failed with code ${sshExecResult.code}: ${sshExecResult.stderr}` });
+            if (activeStreams.get(socket.id)?.command === tailCommand) {
+              activeStreams.delete(socket.id);
+            }
+        }
+      }).catch(err => { // Catches errors from streamPwnagotchiCommand itself (e.g., SSH connection issue)
+        logger.error(`Failed to establish log stream for ${socket.id} (file: ${logFile}): ${err.message}`);
+        socket.emit('pwnagotchi:logs:stream_error', { logFile, error: `Failed to establish log stream: ${err.message}` });
+        if (activeStreams.get(socket.id)?.command === tailCommand) {
+            activeStreams.delete(socket.id);
+        }
+      });
+
+    } catch (error) { // Catch synchronous errors from trying to call streamPwnagotchiCommand
+      logger.error(`Synchronous error starting log stream for ${socket.id} (file: ${logFile}): ${error.message}`);
+      socket.emit('pwnagotchi:logs:stream_error', { logFile, error: `Error starting log stream: ${error.message}` });
+    }
+  });
+
+  socket.on('pwnagotchi:logs:stop_stream', () => {
+    logger.info(`Client ${socket.id} requested log stream stop.`);
+    if (activeStreams.has(socket.id)) {
+      const streamData = activeStreams.get(socket.id);
+      logger.warn(`Stopping log stream for ${socket.id} (command: ${streamData.command}). The remote 'tail -f' process might not be killed by this action due to limitations with node-ssh's execCommand for long-running processes. It will stop if the SSH session ends or a new stream is started on this socket.`);
+      // TODO: Implement a reliable way to kill the remote `tail -f` process if `streamPwnagotchiCommand` is adapted to support it (e.g., by managing PIDs).
+      activeStreams.delete(socket.id); // Remove from tracking, effectively stopping our handling of it.
+      socket.emit('pwnagotchi:logs:stream_stopped', { message: 'Log stream stop request processed. Data flow will cease. Remote process termination is best-effort.' });
+    } else {
+      socket.emit('pwnagotchi:logs:stream_stopped', { message: 'No active log stream to stop for this session.' });
+    }
   });
 
   socket.on('disconnect', (reason) => {
     logger.info({ msg: 'socket_io_client_disconnected', id: socket.id, reason: reason });
-    pwnagotchiWebsocketConnections.dec(); // Decrement active connections
+    pwnagotchiWebsocketConnections.dec();
+    if (activeStreams.has(socket.id)) {
+      const streamData = activeStreams.get(socket.id);
+      logger.warn(`Client ${socket.id} disconnected with active stream (command: ${streamData.command}). Stream will be orphaned on server unless explicitly killed on Pwnagotchi.`);
+      // TODO: As above, implement robust remote process killing on disconnect.
+      activeStreams.delete(socket.id);
+    }
   });
 
   socket.on('error', (error) => {
@@ -215,7 +356,7 @@ const PWNAGOTCHI_POLL_INTERVAL = parseInt(process.env.PWNAGOTCHI_POLL_INTERVAL_M
 //   } catch (error) {
 //     logger.error('Error during Pwnagotchi polling loop:', { message: error.message, stack: error.stack });
 //   }
-import { executePwnagotchiCommand, getPwnagotchiApiData, parseRecentHandshakes, parseUnits, parseAIStatus } from './lib/pwnagotchiService.js';
+// import { executePwnagotchiCommand, getPwnagotchiApiData, parseRecentHandshakes, parseUnits, parseAIStatus } from './lib/pwnagotchiService.js'; // Already imported at the top
 
 // Keep track of last fetched data to emit only diffs or based on actual changes
 // This is a simplistic approach; a more robust system might use etags, last-modified, or sequence numbers from the Pwnagotchi
@@ -230,86 +371,113 @@ async function pollForPwnagotchiUpdates() {
 
     // 1. Fetch Handshakes
     // Prioritize API if available, fallback to CLI
+    let pwnagotchiIsConnected = false; // Flag to track if any data fetch was successful in this poll
+    let overallUptime = 0;
+
+    // 1. Fetch Handshakes
     let handshakesData;
-    if (process.env.PWNAGOTCHI_API_BASE_URL) {
-      // Assuming an API endpoint for recent handshakes, e.g., /api/v1/handshakes/recent
-      // This specific endpoint is hypothetical for handshakes via API.
-      // handshakesData = await getPwnagotchiApiData('/api/v1/handshakes/recent');
-      // For now, let's stick to CLI for handshakes as it's more commonly exposed this way by pwnagotchi
-    }
-    // Fallback or primary method: CLI
-    if (!handshakesData) {
-      const handshakeResult = await executePwnagotchiCommand('pwnagotchi-cli handshakes recent'); // Adjust command as needed
-      if (handshakeResult.code === 0 && handshakeResult.stdout) {
-        handshakesData = parseRecentHandshakes(handshakeResult.stdout);
-      } else {
-        logger.warn(`Failed to fetch handshakes via CLI: ${handshakeResult.stderr || 'No output'}`);
+    try {
+      if (process.env.PWNAGOTCHI_API_BASE_URL) {
+        // handshakesData = await getPwnagotchiApiData('/api/v1/handshakes/recent'); // Hypothetical
       }
-    }
-
-    if (handshakesData) {
-      // Basic diffing or just emit the latest set
-      const newHandshakesCount = handshakesData.filter(h =>
-        !lastKnownHandshakes.some(old_h => JSON.stringify(old_h) === JSON.stringify(h))
-      ).length;
-
-      if (newHandshakesCount > 0 || handshakesData.length !== lastKnownHandshakes.length) {
-         // Update metric only if there are genuinely new items or the list length changed
-        pwnagotchiHandshakesTotal.inc(newHandshakesCount); // Increment by the number of new handshakes
-        logger.info(`Found ${handshakesData.length} handshakes (${newHandshakesCount} new). Broadcasting...`);
-        io.emit('handshakes:update', handshakesData);
-        lastKnownHandshakes = JSON.parse(JSON.stringify(handshakesData)); // Deep copy
+      if (!handshakesData) {
+        const handshakeResult = await executePwnagotchiCommand('pwnagotchi-cli handshakes recent');
+        if (handshakeResult.code === 0 && handshakeResult.stdout) {
+          handshakesData = parseRecentHandshakes(handshakeResult.stdout);
+          pwnagotchiIsConnected = true; // Mark as connected if this succeeds
+        } else {
+          logger.warn(`Failed to fetch handshakes via CLI: ${handshakeResult.stderr || 'No output'} (Code: ${handshakeResult.code})`);
+        }
       }
-    }
+
+      if (handshakesData) {
+        const newHandshakesCount = handshakesData.filter(h =>
+          !lastKnownHandshakes.some(old_h => JSON.stringify(old_h) === JSON.stringify(h))
+        ).length;
+        if (newHandshakesCount > 0 || handshakesData.length !== lastKnownHandshakes.length) {
+          pwnagotchiHandshakesTotal.inc(newHandshakesCount);
+          logger.info(`Found ${handshakesData.length} handshakes (${newHandshakesCount} new). Broadcasting...`);
+          io.emit('handshakes:update', handshakesData);
+          lastKnownHandshakes = JSON.parse(JSON.stringify(handshakesData));
+        }
+      }
+    } catch (e) { logger.error('Error fetching handshakes:', e.message); }
 
     // 2. Fetch Network Updates (Units)
     let networksData;
-    if (process.env.PWNAGOTCHI_API_BASE_URL) {
-      networksData = await getPwnagotchiApiData('/api/v1/units'); // As per existing grid.js
-    } else {
-      const networkResult = await executePwnagotchiCommand('pwnagotchi-cli units'); // Hypothetical
-      if (networkResult.code === 0 && networkResult.stdout) {
-        networksData = parseUnits(networkResult.stdout);
+    try {
+      if (process.env.PWNAGOTCHI_API_BASE_URL) {
+        networksData = await getPwnagotchiApiData('/api/v1/units');
+        if (networksData) pwnagotchiIsConnected = true;
       } else {
-        logger.warn(`Failed to fetch networks via CLI: ${networkResult.stderr || 'No output'}`);
+        const networkResult = await executePwnagotchiCommand('pwnagotchi-cli units');
+        if (networkResult.code === 0 && networkResult.stdout) {
+          networksData = parseUnits(networkResult.stdout);
+          if (networksData) pwnagotchiIsConnected = true;
+        } else {
+          logger.warn(`Failed to fetch networks via CLI: ${networkResult.stderr || 'No output'} (Code: ${networkResult.code})`);
+        }
       }
-    }
-    if (networksData) {
-      pwnagotchiNetworksDetectedTotal.set(networksData.length); // Set to current count
-      if (JSON.stringify(networksData) !== JSON.stringify(lastKnownNetworks)) {
-        logger.info(`Found ${networksData.length} networks. Broadcasting...`);
-        io.emit('networks:update', networksData);
-        lastKnownNetworks = JSON.parse(JSON.stringify(networksData)); // Deep copy
+      if (networksData) {
+        pwnagotchiNetworksDetectedTotal.set(networksData.length);
+        if (JSON.stringify(networksData) !== JSON.stringify(lastKnownNetworks)) {
+          logger.info(`Found ${networksData.length} networks. Broadcasting...`);
+          io.emit('networks:update', networksData);
+          lastKnownNetworks = JSON.parse(JSON.stringify(networksData));
+        }
       }
-    }
+    } catch (e) { logger.error('Error fetching networks:', e.message); }
 
-    // 3. Fetch AI Status
+    // 3. Fetch AI Status (which often includes uptime)
     let aiStatusData;
-    if (process.env.PWNAGOTCHI_API_BASE_URL) {
-      // Common Pwnagotchi API endpoint for display status
-      aiStatusData = await getPwnagotchiApiData('/api/v1/status-display');
-    } else {
-      const aiStatusResult = await executePwnagotchiCommand('pwnagotchi-cli status'); // Hypothetical
-      if (aiStatusResult.code === 0 && aiStatusResult.stdout) {
-        aiStatusData = parseAIStatus(aiStatusResult.stdout);
+    try {
+      if (process.env.PWNAGOTCHI_API_BASE_URL) {
+        aiStatusData = await getPwnagotchiApiData('/api/v1/status-display');
+        if (aiStatusData) pwnagotchiIsConnected = true;
       } else {
-        logger.warn(`Failed to fetch AI status via CLI: ${aiStatusResult.stderr || 'No output'}`);
+        const aiStatusResult = await executePwnagotchiCommand('pwnagotchi-cli status');
+        if (aiStatusResult.code === 0 && aiStatusResult.stdout) {
+          aiStatusData = parseAIStatus(aiStatusResult.stdout);
+          if (aiStatusData) pwnagotchiIsConnected = true;
+        } else {
+          logger.warn(`Failed to fetch AI status via CLI: ${aiStatusResult.stderr || 'No output'} (Code: ${aiStatusResult.code})`);
+        }
       }
-    }
-    if (aiStatusData) {
-       if (JSON.stringify(aiStatusData) !== JSON.stringify(lastKnownAIStatus)) {
-        logger.info('AI status change detected. Broadcasting...', aiStatusData);
-        io.emit('ai:status', aiStatusData);
-        lastKnownAIStatus = aiStatusData;
+      if (aiStatusData) {
+        if (JSON.stringify(aiStatusData) !== JSON.stringify(lastKnownAIStatus)) {
+          logger.info('AI status change detected. Broadcasting...', aiStatusData);
+          io.emit('ai:status', aiStatusData);
+          lastKnownAIStatus = aiStatusData;
+        }
+        // Update uptime metric if available in AI status
+        // Common Pwnagotchi status output includes 'uptime' in seconds or human-readable.
+        // Assuming 'uptime' is a field in seconds.
+        if (typeof aiStatusData.uptime === 'number') {
+          overallUptime = aiStatusData.uptime;
+        } else if (typeof aiStatusData.uptime === 'string') { // Try to parse if string like "1 day, 2:30:00"
+            // Basic parsing for "X day(s), HH:MM:SS" or "HH:MM:SS" - this is a simplification
+            // A more robust parser would be needed for various uptime string formats.
+            // For now, only direct number or simple "HH:MM:SS" or "MM:SS" or "SS"
+            const parts = aiStatusData.uptime.split(',').pop().trim().split(':').map(Number);
+            if (parts.length === 3) overallUptime = parts[0] * 3600 + parts[1] * 60 + parts[2];
+            else if (parts.length === 2) overallUptime = parts[0] * 60 + parts[1];
+            else if (parts.length === 1) overallUptime = parts[0];
+        }
       }
+    } catch (e) { logger.error('Error fetching AI status:', e.message); }
+
+    // Update connection status and uptime metrics
+    pwnagotchiConnectionStatus.set(pwnagotchiIsConnected ? 1 : 0);
+    if (pwnagotchiIsConnected && overallUptime > 0) {
+        pwnagotchiReportedUptime.set(overallUptime);
+    } else if (!pwnagotchiIsConnected) {
+        pwnagotchiReportedUptime.set(0); // Reset uptime if disconnected
     }
 
-    // 4. Fetch new logs (This is more complex and might require different strategies like tailing a log file)
-    // For now, we'll skip live log streaming via polling in this iteration.
-    // logger.debug('Live log polling not implemented in this cycle.');
-
-  } catch (error) {
-    logger.error('Error during Pwnagotchi polling loop:', { message: error.message, stack: error.stack });
+  } catch (error) { // Catch any unexpected errors from the overall polling logic
+    logger.error('Critical error in Pwnagotchi polling loop:', { message: error.message, stack: error.stack });
+    pwnagotchiConnectionStatus.set(0); // Assume disconnected on critical error
+    pwnagotchiReportedUptime.set(0);
   }
 }
 

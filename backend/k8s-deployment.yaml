@@ -8,58 +8,77 @@ metadata:
   labels:
     app.kubernetes.io/name: pwnagotchi-dashboard
 data:
+  # Helm chart: data: {{ toYaml .Values.config | nindent 2 }}
   NODE_ENV: "production"
-  LOG_LEVEL: "info"
+  LOG_LEVEL: "info" # e.g., {{ .Values.config.logLevel | default "info" }}
   BACKEND_PORT: "3001"
-  REDIS_URL: "redis://pwnagotchi-redis-service:6379"
+  REDIS_URL: "redis://pwnagotchi-redis-service:6379" # Assumes Redis service name
   WEBSOCKET_PATH: "/socket.io"
   ENABLE_PWNAGOTCHI_POLLING: "true"
   PWNAGOTCHI_POLL_INTERVAL_MS: "5000"
   ENABLE_METRICS: "true"
-  PWNAGOTCHI_HOST: "your-pwnagotchi-ip-or-hostname" # Replace
-  PWNAGOTCHI_PORT: "22"
-  PWNAGOTCHI_USER: "pi"
-  PWNAGOTCHI_SSH_KEY_PATH: "/mnt/ssh-keys/pwnagotchi_rsa"
-  PWNAGOTCHI_API_BASE_URL: "http://your-pwnagotchi-ip-or-hostname:8666/api/v1" # If Pwnagotchi has a direct API
-  VITE_API_URL: "/api"
-  VITE_WS_URL: ""
-  VITE_WEBSOCKET_PATH: "/socket.io"
+
+  # Pwnagotchi Connection (replace with actual values or use Secrets for sensitive parts)
+  PWNAGOTCHI_HOST: "your-pwnagotchi-ip-or-hostname" # {{ .Values.pwnagotchi.host }}
+  PWNAGOTCHI_PORT: "22" # {{ .Values.pwnagotchi.port | default "22" }}
+  PWNAGOTCHI_USER: "pi" # {{ .Values.pwnagotchi.user | default "pi" }}
+  # PWNAGOTCHI_SSH_KEY_PATH is the path *inside the container* where the key from the secret will be mounted.
+  PWNAGOTCHI_SSH_KEY_PATH: "/etc/ssh-keys/pwnagotchi_rsa" # Standardized path
+  PWNAGOTCHI_API_BASE_URL: "http://your-pwnagotchi-ip-or-hostname:8666/api/v1" # {{ .Values.pwnagotchi.apiBaseUrl }} (if used)
+
+  # Rate Limiting
+  RATE_LIMIT_WINDOW_MS: "900000" # 15 minutes
+  RATE_LIMIT_MAX_REQUESTS: "100"
+
+  # CORS Origin
+  CORS_ORIGIN: "http://your-frontend-service-or-ingress-url" # {{ .Values.corsOrigin }}
+
+  # Frontend build-time args (documented here, but set during frontend image build)
+  # VITE_API_URL: "/api"
+  # VITE_WS_URL: "" # Typically derived by frontend based on its own host
+  # VITE_WEBSOCKET_PATH: "/socket.io"
 
 ---
 # --- Backend Deployment ---
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: pwnagotchi-backend
+  name: pwnagotchi-backend # Helm: {{ .Release.Name }}-backend
   labels:
     app.kubernetes.io/name: pwnagotchi-dashboard
     app.kubernetes.io/component: backend
+    # Helm: {{ include "pwnagotchi-dashboard.labels" . | nindent 4 }}
+    # Helm: app.kubernetes.io/instance: {{ .Release.Name }}
 spec:
-  replicas: 1
+  replicas: 1 # {{ .Values.backend.replicaCount | default 1 }}
   selector:
     matchLabels:
       app.kubernetes.io/name: pwnagotchi-dashboard
       app.kubernetes.io/component: backend
+      # Helm: app.kubernetes.io/instance: {{ .Release.Name }}
   template:
     metadata:
       labels:
         app.kubernetes.io/name: pwnagotchi-dashboard
         app.kubernetes.io/component: backend
+        # Helm: {{ include "pwnagotchi-dashboard.labels" . | nindent 8 }}
+        # Helm: app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      # serviceAccountName: {{ .Values.backend.serviceAccountName | default "default" }}
       containers:
       - name: backend
-        image: yourregistry/pwnagotchi-backend:latest # Replace
-        imagePullPolicy: IfNotPresent
+        image: yourregistry/pwnagotchi-backend:latest # {{ .Values.backend.image.repository }}:{{ .Values.backend.image.tag | default .Chart.AppVersion }}
+        imagePullPolicy: IfNotPresent # {{ .Values.backend.image.pullPolicy | default "IfNotPresent" }}
         ports:
         - name: http
           containerPort: 3001 # Matches BACKEND_PORT
         envFrom:
         - configMapRef:
-            name: pwnagotchi-dashboard-config
-        # volumeMounts:
-        # - name: ssh-key-volume
-        #   mountPath: "/mnt/ssh-keys"
-        #   readOnly: true
+            name: pwnagotchi-dashboard-config # Helm: {{ .Release.Name }}-config
+        volumeMounts:
+        - name: ssh-key-volume
+          mountPath: "/etc/ssh-keys" # Mount directory
+          readOnly: true
         livenessProbe:
           httpGet:
             path: /healthz
@@ -72,14 +91,15 @@ spec:
             port: http
           initialDelaySeconds: 5
           periodSeconds: 10
-        resources:
+        resources: # {{ toYaml .Values.backend.resources | nindent 10 }}
           requests: { cpu: "100m", memory: "128Mi" }
           limits: { cpu: "500m", memory: "256Mi" }
-      # volumes:
-      # - name: ssh-key-volume
-      #   secret:
-      #     secretName: pwnagotchi-ssh-key # Create this secret separately
-      #     defaultMode: 0400
+      volumes:
+      - name: ssh-key-volume
+        secret:
+          secretName: pwnagotchi-ssh-key # {{ .Values.pwnagotchi.sshKeySecretName }} - User must create this secret
+          # The secret should contain a key named 'pwnagotchi_rsa' (or whatever the PWNAGOTCHI_SSH_KEY_PATH filename is)
+          defaultMode: 0400 # SSH key permissions
 
 ---
 # --- Backend Service ---
@@ -263,6 +283,119 @@ spec:
   #     target:
   #       type: Utilization
   #       averageUtilization: 70
+
+---
+# --- Prometheus ConfigMap for its configuration ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pwnagotchi-prometheus-config
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: monitoring
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 15s
+    scrape_configs:
+      - job_name: 'pwnagotchi-backend'
+        static_configs:
+          - targets: ['pwnagotchi-backend-service:80'] # Service name and port for backend
+
+---
+# --- Prometheus Deployment ---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pwnagotchi-prometheus
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: monitoring
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pwnagotchi-dashboard
+      app.kubernetes.io/component: monitoring
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pwnagotchi-dashboard
+        app.kubernetes.io/component: monitoring
+    spec:
+      containers:
+      - name: prometheus
+        image: prom/prometheus:v2.47.0
+        args:
+          - '--config.file=/etc/prometheus/prometheus.yml'
+          - '--storage.tsdb.path=/prometheus'
+        ports:
+        - name: web
+          containerPort: 9090
+        volumeMounts:
+        - name: config-volume
+          mountPath: /etc/prometheus
+        - name: storage-volume
+          mountPath: /prometheus
+        resources:
+          requests: { cpu: "100m", memory: "256Mi" }
+          limits: { cpu: "500m", memory: "512Mi" }
+      volumes:
+      - name: config-volume
+        configMap:
+          name: pwnagotchi-prometheus-config
+      - name: storage-volume
+        emptyDir: {} # For ephemeral storage; use PVC for persistence
+
+---
+# --- Prometheus Service ---
+apiVersion: v1
+kind: Service
+metadata:
+  name: pwnagotchi-prometheus-service
+  labels:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: monitoring
+spec:
+  type: ClusterIP # Or LoadBalancer/NodePort if you want to expose it externally directly
+  selector:
+    app.kubernetes.io/name: pwnagotchi-dashboard
+    app.kubernetes.io/component: monitoring
+  ports:
+  - name: web
+    port: 9090
+    targetPort: web
+
+# --- Optional: Example PrometheusRule for Alertmanager (if Alertmanager is also deployed) ---
+# apiVersion: monitoring.coreos.com/v1
+# kind: PrometheusRule
+# metadata:
+#   name: pwnagotchi-alerts
+#   labels:
+#     app.kubernetes.io/name: pwnagotchi-dashboard
+#     app.kubernetes.io/component: monitoring
+#     # prometheus: kube-prometheus # If using kube-prometheus-stack, label for discovery
+#     # release: prometheus # Label for discovery by Prometheus Operator
+# spec:
+#   groups:
+#   - name: pwnagotchi.rules
+#     rules:
+#     - alert: PwnagotchiDisconnected
+#       expr: pwnagotchi_connection_status == 0
+#       for: 5m
+#       labels:
+#         severity: warning
+#       annotations:
+#         summary: Pwnagotchi backend disconnected from device
+#         description: The Pwnagotchi backend has been unable to poll data from the Pwnagotchi device for 5 minutes.
+#     - alert: PwnagotchiHighHandshakeRateAnomaly
+#       expr: rate(pwnagotchi_handshakes_total[5m]) > 10 # Example: more than 10 handshakes per 5 min is anomalous
+#       for: 10m
+#       labels:
+#         severity: info
+#       annotations:
+#         summary: Pwnagotchi high handshake rate
+#         description: Pwnagotchi is capturing handshakes at a rate higher than 10 per 5 minutes. Value {{ $value }}.
 
 # --- Optional: Ingress for Frontend ---
 # apiVersion: networking.k8s.io/v1

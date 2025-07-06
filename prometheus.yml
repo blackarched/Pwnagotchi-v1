@@ -1,0 +1,12 @@
+# prometheus.yml
+global:
+  scrape_interval: 15s # By default, scrape targets every 15 seconds.
+  evaluation_interval: 15s # By default, evaluate rules every 15 seconds.
+
+scrape_configs:
+  - job_name: 'pwnagotchi-backend'
+    # metrics_path defaults to '/metrics'
+    # scheme defaults to 'http'.
+    static_configs:
+      - targets: ['backend:3001'] # 'backend' is the service name in docker-compose, 3001 is the port it listens on
+[end of prometheus.yml]
